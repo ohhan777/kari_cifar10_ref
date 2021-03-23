@@ -9,7 +9,6 @@ import torch.optim as optim
 import time
 from pathlib import Path
 from torch.utils.tensorboard import SummaryWriter
-from apex import amp
 
 def train(opt):
     epochs = opt.epochs
@@ -46,18 +45,21 @@ def train(opt):
     model = MyVGG11()
 
     # GPU-support
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.device_count() > 1:   # multi-GPU
+       model = torch.nn.DataParallel(model)
     model.to(device)
 
     # Loss function and optimizer
     loss_fn = nn.CrossEntropyLoss()
     optimizer = optim.SGD(model.parameters(), lr=0.001, momentum=0.9)
 
-    # apex
-    model, optimizer = amp.initialize(model, optimizer, opt_level='O2')
-
-    #if torch.cuda.device_count() > 1:   # multi-GPU
-    #    model = torch.nn.DataParallel(model)
+    # AMP
+    if torch.cuda.is_available() and opt.amp == True:
+        scaler = torch.cuda.amp.GradScaler()
+        print('[AMP Enabled]')
+    else:
+        scaler = None
 
     # Learning rate scheduler
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
@@ -69,8 +71,6 @@ def train(opt):
     if os.path.exists(weight_file):
         checkpoint = torch.load(weight_file)
         model.load_state_dict(checkpoint['model'])
-        optimizer.load_state_dict(checkpoint['optimizer'])
-        amp.load_state_dict(checkpoint['amp'])
         start_epoch = checkpoint['epoch'] + 1
         best_accuracy = checkpoint['best_accuracy']
         print('resumed from epoch %d' % start_epoch)
@@ -79,7 +79,7 @@ def train(opt):
     for epoch in range(start_epoch, end_epoch):
         print('epoch: %d/%d' % (epoch, end_epoch-1))
         t0 = time.time()
-        epoch_loss = train_one_epoch(train_dataloader, model, loss_fn, optimizer, device)
+        epoch_loss = train_one_epoch(train_dataloader, model, loss_fn, optimizer, device, scaler)
         t1 = time.time()
         print('loss=%.4f (took %.2f sec)' % (epoch_loss, t1-t0))
         lr_scheduler.step()
@@ -90,31 +90,37 @@ def train(opt):
         if accuracy > best_accuracy:
             best_weight_file = Path('weights')/(name + '_best.pth')
             best_accuracy = accuracy
-            state = {'model': model.state_dict(), 'optimizer': optimizer.state_dict(), 
-                     'amp': amp.state_dict(), 'epoch': epoch, 'best_accuracy': best_accuracy}
+            state = {'model': model.state_dict(), 'epoch': epoch, 'best_accuracy': best_accuracy}
             torch.save(state, best_weight_file)
             print('best accuracy=>saved\n')
         # saving the current status into a weight file
-        state = {'model': model.state_dict(), 'optimizer': optimizer.state_dict(), 
-                 'amp': amp.state_dict(), 'epoch': epoch, 'best_accuracy': best_accuracy}
+        state = {'model': model.state_dict(), 'epoch': epoch, 'best_accuracy': best_accuracy}
         torch.save(state, weight_file)
         # tensorboard logging
         tb_writer.add_scalar('train_epoch_loss', epoch_loss, epoch)
         tb_writer.add_scalar('val_epoch_loss', val_epoch_loss, epoch)
         tb_writer.add_scalar('val_accuracy', accuracy, epoch)
 
-def train_one_epoch(train_dataloader, model, loss_fn, optimizer, device):
+def train_one_epoch(train_dataloader, model, loss_fn, optimizer, device, scaler=None):
     model.train()
     losses = [] 
     for i, (imgs, targets) in enumerate(train_dataloader):
         imgs, targets = imgs.to(device), targets.to(device)
         optimizer.zero_grad()   # zeros the parameter gradients
-        preds = model(imgs)     # forward
-        loss = loss_fn(preds, targets) # calculates the iteration loss  
-        with amp.scale_loss(loss, optimizer) as scaled_loss:
-            scaled_loss.backward()
-        #loss.backward()         # backward
-        optimizer.step()        # update weights
+        if scaler is None:
+            preds = model(imgs)     # forward
+            loss = loss_fn(preds, targets) # calculates the iteration loss  
+            loss.backward()         # backward
+            optimizer.step()        # update weights
+        else:
+            with torch.cuda.amp.autocast():
+                preds = model(imgs)     # forward
+                loss = loss_fn(preds, targets)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+        
         # print the iteration loss every 100 iterations
         if i % 100 == 0:
             print('\t iteration: %d/%d, loss=%.4f' % (i, len(train_dataloader)-1, loss))    
@@ -144,7 +150,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--epochs', type=int, default=200, help='target epochs')
     parser.add_argument('--batch-size', type=int, default=128, help='batch size')
-    parser.add_argument('--name', default='apex_resnet2', help='name for the run')
+    parser.add_argument('--name', default='myvgg11_amp', help='name for the run')
+    parser.add_argument('--amp', action='store_true', help='use of amp')
 
     opt = parser.parse_args()
 
